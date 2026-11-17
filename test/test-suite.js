@@ -5492,6 +5492,207 @@
     });
 
     // =======================================================================
+    // Hooks — nested sanitize() calls
+    //
+    // A hook may call DOMPurify.sanitize() while an outer call is mid-walk.
+    // Both calls share the instance's closure variables, so the nested call's
+    // _parseConfig() would replace the outer call's allowlists mid-walk: the
+    // rest of the outer tree would be sanitized under the nested config. The
+    // outer state is now captured before a nested call and restored when it
+    // returns, so a nested config can never widen (or narrow) the outer one.
+    // =======================================================================
+    QUnit.module('Hooks — nested sanitize()', function (hooks) {
+      let purify;
+      hooks.beforeEach(() => {
+        purify = DOMPurify(window);
+      });
+      hooks.afterEach(() => {
+        purify.removeAllHooks();
+        purify.clearConfig();
+      });
+
+      QUnit.test(
+        'nested call with wider config does not replace outer ALLOWED_TAGS',
+        (assert) => {
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (node.nodeName === 'B') {
+              // Nested call runs under the much wider default config.
+              purify.sanitize('<div><i>inner</i></div>');
+            }
+          });
+
+          assert.equal(
+            purify.sanitize('<b>x</b><div>y</div><script>alert(1)</script>', {
+              ALLOWED_TAGS: ['b'],
+            }),
+            '<b>x</b>y',
+            'outer walk keeps its own allowlist after the nested call'
+          );
+        }
+      );
+
+      QUnit.test(
+        'nested call with wider config does not replace outer ALLOWED_ATTR',
+        (assert) => {
+          let once = false;
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (node.nodeName === 'A' && !once) {
+              once = true;
+              purify.sanitize('<a onclick="x()">y</a>', {
+                ADD_ATTR: ['onclick'],
+              });
+            }
+          });
+
+          assert.equal(
+            purify.sanitize('<a href="#">x</a><span onclick="alert(1)">y</span>'),
+            '<a href="#">x</a><span>y</span>',
+            'outer attribute checks are unaffected by the nested config'
+          );
+        }
+      );
+
+      QUnit.test('nested FORBID_TAGS does not leak into the outer call', (assert) => {
+        purify.addHook('uponSanitizeElement', (node) => {
+          if (node.nodeName === 'B') {
+            purify.sanitize('<i>z</i>', { FORBID_TAGS: ['i'] });
+          }
+        });
+
+        assert.equal(
+          purify.sanitize('<b>x</b><i>y</i>'),
+          '<b>x</b><i>y</i>',
+          'narrowing by the nested config must not leak either'
+        );
+      });
+
+      QUnit.test(
+        'setConfig: nested call does not clobber the persistent config',
+        (assert) => {
+          purify.setConfig({ ALLOWED_TAGS: ['b'] });
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (node.nodeName === 'B') {
+              purify.sanitize('<div>inner</div>');
+            }
+          });
+
+          assert.equal(
+            purify.sanitize('<b>x</b><div>y</div>'),
+            '<b>x</b>y',
+            'outer walk keeps the setConfig allowlist after the nested call'
+          );
+        }
+      );
+
+      QUnit.test(
+        'nested call does not wipe the outer removal log',
+        (assert) => {
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (node.nodeName === 'B') {
+              purify.sanitize('t<script>inner</script>');
+            }
+          });
+
+          purify.sanitize('<b>x</b><script>outer</script>');
+          assert.equal(
+            purify.removed.length,
+            2,
+            'outer and nested removals are both recorded'
+          );
+        }
+      );
+
+      QUnit.test(
+        'runaway recursive hook throws but leaves a clean instance',
+        (assert) => {
+          purify.addHook('uponSanitizeElement', () => {
+            purify.sanitize('<u>recurse</u>', { ALLOWED_TAGS: ['u'] });
+          });
+
+          assert.throws(() => purify.sanitize('<div>x</div>'));
+
+          purify.removeAllHooks();
+          assert.equal(
+            purify.sanitize('<svg><script>alert(1)</script></svg><u>ok</u>'),
+            '<svg></svg><u>ok</u>',
+            'default config is intact after the recursion crash'
+          );
+        }
+      );
+
+      QUnit.test(
+        'throwing nested call still restores the outer config',
+        (assert) => {
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (node.nodeName === 'B') {
+              try {
+                purify.sanitize('<div>x</div>', {
+                  ALLOWED_TAGS: ['div'],
+                  TRUSTED_TYPES_POLICY: {
+                    createHTML() {
+                      throw new Error('boom');
+                    },
+                    createScriptURL(s) {
+                      return s;
+                    },
+                  },
+                });
+              } catch (_) {
+                /* the nested policy throws on signing */
+              }
+            }
+          });
+
+          assert.equal(
+            purify.sanitize('<b>x</b><img src="y">', { ALLOWED_TAGS: ['b'] }),
+            '<b>x</b>',
+            'outer allowlist survives a nested call that throws'
+          );
+        }
+      );
+
+      QUnit.test(
+        'nested output inserted by a hook is sanitized under the outer config',
+        (assert) => {
+          purify.addHook('uponSanitizeElement', (node) => {
+            if (node.nodeName === 'B') {
+              const frag = purify.sanitize(
+                '<span><script>alert(1)</script>ok</span>',
+                { RETURN_DOM: true }
+              );
+              node.appendChild(frag);
+            }
+          });
+
+          assert.equal(
+            purify.sanitize('<b>x</b>', { ALLOWED_TAGS: ['b'] }),
+            '<b>xok</b>',
+            'inserted <span> is stripped by the outer allowlist, its text kept'
+          );
+        }
+      );
+
+      QUnit.test('deeply nested calls restore each level', (assert) => {
+        purify.addHook('uponSanitizeElement', (node) => {
+          if (node.nodeName === 'B') {
+            purify.sanitize('<i>x</i>', {
+              ALLOWED_TAGS: ['i'],
+              ADD_ATTR: ['onclick'],
+            });
+          }
+        });
+
+        assert.equal(
+          purify.sanitize('<b>x</b><u onclick="alert(1)">y</u>', {
+            ALLOWED_TAGS: ['b', 'u'],
+          }),
+          '<b>x</b><u>y</u>',
+          'onclick from the nested ADD_ATTR does not survive in the outer call'
+        );
+      });
+    });
+
+    // =======================================================================
     // Hooks — shadow roots nested inside <template>.content
     //
     // Two patches landed together to close a class of bypasses:

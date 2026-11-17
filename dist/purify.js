@@ -1211,6 +1211,7 @@
 		let KEEP_CONTENT = true;
 		let IN_PLACE = false;
 		let IN_PLACE_VISITED = null;
+		let SANITIZE_DEPTH = 0;
 		let USE_PROFILES = false;
 		let FORBID_CONTENTS = null;
 		const DEFAULT_FORBID_CONTENTS = addToSet({}, [
@@ -2379,7 +2380,121 @@
 				}
 			}
 		};
+		/**
+		* Captures every piece of per-call state that a nested sanitize() call
+		* overwrites: the parsed config, the Trusted Types policy, the empty-input
+		* flag and the removal log. Restored by _restoreSanitizeState when the
+		* nested call returns, so a nested config can never replace the outer
+		* call's allowlists mid-walk.
+		*
+		* @return the captured state
+		*/
+		const _captureSanitizeState = function _captureSanitizeState() {
+			return {
+				removed: DOMPurify.removed,
+				isEmptyInput: IS_EMPTY_INPUT,
+				parserMediaType: PARSER_MEDIA_TYPE,
+				transformCase: transformCaseFunc,
+				allowedTags: ALLOWED_TAGS,
+				allowedAttr: ALLOWED_ATTR,
+				allowedNamespaces: ALLOWED_NAMESPACES,
+				uriSafeAttributes: URI_SAFE_ATTRIBUTES,
+				dataUriTags: DATA_URI_TAGS,
+				forbidContents: FORBID_CONTENTS,
+				forbidTags: FORBID_TAGS,
+				forbidAttr: FORBID_ATTR,
+				useProfiles: USE_PROFILES,
+				allowAriaAttr: ALLOW_ARIA_ATTR,
+				allowDataAttr: ALLOW_DATA_ATTR,
+				allowUnknownProtocols: ALLOW_UNKNOWN_PROTOCOLS,
+				allowSelfCloseInAttr: ALLOW_SELF_CLOSE_IN_ATTR,
+				safeForTemplates: SAFE_FOR_TEMPLATES,
+				safeForXml: SAFE_FOR_XML,
+				wholeDocument: WHOLE_DOCUMENT,
+				returnDom: RETURN_DOM,
+				returnDomFragment: RETURN_DOM_FRAGMENT,
+				returnTrustedType: RETURN_TRUSTED_TYPE,
+				forceBody: FORCE_BODY,
+				sanitizeDom: SANITIZE_DOM,
+				sanitizeNamedProps: SANITIZE_NAMED_PROPS,
+				keepContent: KEEP_CONTENT,
+				inPlace: IN_PLACE,
+				isAllowedUri: IS_ALLOWED_URI$1,
+				namespace: NAMESPACE,
+				mathMlTextIntegrationPoints: MATHML_TEXT_INTEGRATION_POINTS,
+				htmlIntegrationPoints: HTML_INTEGRATION_POINTS,
+				customElementHandling: CUSTOM_ELEMENT_HANDLING,
+				extraTagCheck: EXTRA_ELEMENT_HANDLING.tagCheck,
+				extraAttributeCheck: EXTRA_ELEMENT_HANDLING.attributeCheck,
+				policy: trustedTypesPolicy,
+				empty: emptyHTML,
+				config: CONFIG
+			};
+		};
+		/**
+		* Restores the state captured by _captureSanitizeState after a nested
+		* sanitize() call. The nested call's removal records are merged into the
+		* outer log, so an outer IN_PLACE call still neutralizes everything that
+		* was removed and the nested removals stay visible to the caller.
+		*
+		* @param state the captured outer state
+		*/
+		const _restoreSanitizeState = function _restoreSanitizeState(state) {
+			const nestedRemoved = DOMPurify.removed;
+			DOMPurify.removed = state.removed;
+			arrayForEach(nestedRemoved, (entry) => {
+				arrayPush(DOMPurify.removed, entry);
+			});
+			IS_EMPTY_INPUT = state.isEmptyInput;
+			PARSER_MEDIA_TYPE = state.parserMediaType;
+			transformCaseFunc = state.transformCase;
+			ALLOWED_TAGS = state.allowedTags;
+			ALLOWED_ATTR = state.allowedAttr;
+			ALLOWED_NAMESPACES = state.allowedNamespaces;
+			URI_SAFE_ATTRIBUTES = state.uriSafeAttributes;
+			DATA_URI_TAGS = state.dataUriTags;
+			FORBID_CONTENTS = state.forbidContents;
+			FORBID_TAGS = state.forbidTags;
+			FORBID_ATTR = state.forbidAttr;
+			USE_PROFILES = state.useProfiles;
+			ALLOW_ARIA_ATTR = state.allowAriaAttr;
+			ALLOW_DATA_ATTR = state.allowDataAttr;
+			ALLOW_UNKNOWN_PROTOCOLS = state.allowUnknownProtocols;
+			ALLOW_SELF_CLOSE_IN_ATTR = state.allowSelfCloseInAttr;
+			SAFE_FOR_TEMPLATES = state.safeForTemplates;
+			SAFE_FOR_XML = state.safeForXml;
+			WHOLE_DOCUMENT = state.wholeDocument;
+			RETURN_DOM = state.returnDom;
+			RETURN_DOM_FRAGMENT = state.returnDomFragment;
+			RETURN_TRUSTED_TYPE = state.returnTrustedType;
+			FORCE_BODY = state.forceBody;
+			SANITIZE_DOM = state.sanitizeDom;
+			SANITIZE_NAMED_PROPS = state.sanitizeNamedProps;
+			KEEP_CONTENT = state.keepContent;
+			IN_PLACE = state.inPlace;
+			IS_ALLOWED_URI$1 = state.isAllowedUri;
+			NAMESPACE = state.namespace;
+			MATHML_TEXT_INTEGRATION_POINTS = state.mathMlTextIntegrationPoints;
+			HTML_INTEGRATION_POINTS = state.htmlIntegrationPoints;
+			CUSTOM_ELEMENT_HANDLING = state.customElementHandling;
+			EXTRA_ELEMENT_HANDLING.tagCheck = state.extraTagCheck;
+			EXTRA_ELEMENT_HANDLING.attributeCheck = state.extraAttributeCheck;
+			trustedTypesPolicy = state.policy;
+			emptyHTML = state.empty;
+			CONFIG = state.config;
+		};
 		DOMPurify.sanitize = function(dirty) {
+			let cfg = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : {};
+			const outerState = SANITIZE_DEPTH > 0 ? _captureSanitizeState() : null;
+			SANITIZE_DEPTH++;
+			try {
+				return _sanitize(dirty, cfg);
+			} finally {
+				SANITIZE_DEPTH--;
+				if (outerState) _restoreSanitizeState(outerState);
+			}
+		};
+		const _sanitize = function _sanitize(dirty) {
 			let cfg = arguments.length > 1 && arguments[1] !== void 0 ? arguments[1] : {};
 			let body = null;
 			let importedNode = null;
