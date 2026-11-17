@@ -2132,10 +2132,11 @@ function createDOMPurify() {
 	* @return Returns true if `value` is valid, otherwise false.
 	*/
 	const _isValidAttribute = function _isValidAttribute(lcTag, lcName, value) {
+		let allowedAttrSnapshot = arguments.length > 3 && arguments[3] !== void 0 ? arguments[3] : null;
 		if (FORBID_ATTR[lcName]) return false;
 		if (_isPatchLinkageAttribute(lcName, lcTag)) return false;
 		if (SANITIZE_DOM && (lcName === "id" || lcName === "name") && (value in document || value in formElement)) return false;
-		const nameIsPermitted = ALLOWED_ATTR[lcName] || EXTRA_ELEMENT_HANDLING.attributeCheck instanceof Function && EXTRA_ELEMENT_HANDLING.attributeCheck(lcName, lcTag);
+		const nameIsPermitted = (allowedAttrSnapshot || ALLOWED_ATTR)[lcName] || EXTRA_ELEMENT_HANDLING.attributeCheck instanceof Function && EXTRA_ELEMENT_HANDLING.attributeCheck(lcName, lcTag);
 		if (ALLOW_DATA_ATTR && regExpTest(DATA_ATTR$1, lcName)) return true;
 		if (ALLOW_ARIA_ATTR && regExpTest(ARIA_ATTR$1, lcName)) return true;
 		if (!nameIsPermitted) return _isBasicCustomElement(lcTag) && _matchesNameCheck(CUSTOM_ELEMENT_HANDLING.tagNameCheck, lcTag) && _matchesNameCheck(CUSTOM_ELEMENT_HANDLING.attributeNameCheck, lcName, lcTag) || lcName === "is" && CUSTOM_ELEMENT_HANDLING.allowCustomizedBuiltInElements && _matchesNameCheck(CUSTOM_ELEMENT_HANDLING.tagNameCheck, value);
@@ -2145,6 +2146,30 @@ function createDOMPurify() {
 		if ((lcName === "src" || lcName === "xlink:href" || lcName === "href") && lcTag !== "script" && stringIndexOf(value, "data:") === 0 && DATA_URI_TAGS[lcTag]) return true;
 		if (ALLOW_UNKNOWN_PROTOCOLS && !regExpTest(IS_SCRIPT_OR_DATA$1, compactValue)) return true;
 		return !value;
+	};
+	/**
+	* The single security gate for an attribute, shared by the public
+	* isValidAttribute() precheck and the per-attribute walk in
+	* _sanitizeAttributes. Every check that can condemn an attribute lives
+	* here and nowhere else, so an attribute approved by the precheck cannot
+	* be re-admitted later by a hook (forceKeepAttr/keepAttr), by an
+	* allow-list object widened mid-call, or by configuration re-parsed from
+	* a nested sanitize() call. Conversely, anything this gate rejects is
+	* removed from the final node regardless of hook decisions.
+	*
+	* @param lcTag transformCaseFunc'd tag name of the carrying element
+	* @param name the attribute name as found on the node (case preserved)
+	* @param value the attribute value after hook/template processing
+	* @param allowedAttrSnapshot allow-list membership captured before the
+	*   hooks ran; null means "read the live configuration" (precheck path)
+	* @return true only if the attribute may stay on the final node
+	*/
+	const _passesAttributeSecurityGate = function _passesAttributeSecurityGate(lcTag, name, value) {
+		let allowedAttrSnapshot = arguments.length > 3 && arguments[3] !== void 0 ? arguments[3] : null;
+		const lcName = transformCaseFunc(name);
+		if (_isUnsafeAttributeValue(name, value)) return false;
+		if (!ALLOW_SELF_CLOSE_IN_ATTR && regExpTest(SELF_CLOSING_TAG, value)) return false;
+		return _isValidAttribute(lcTag, lcName, value, allowedAttrSnapshot);
 	};
 	const RESERVED_CUSTOM_ELEMENT_NAMES = addToSet({}, [
 		"annotation-xml",
@@ -2240,6 +2265,7 @@ function createDOMPurify() {
 		const attributes = _readAttributes(currentNode);
 		if (!attributes || _isClobbered(currentNode)) return;
 		ALLOWED_ATTR = _forkSharedAllowlist(hooks.uponSanitizeAttribute, ALLOWED_ATTR, DEFAULT_ALLOWED_ATTR, SET_CONFIG_ALLOWED_ATTR);
+		const allowedAttrSnapshot = cloneSet(ALLOWED_ATTR);
 		const hookEvent = {
 			attrName: "",
 			attrValue: "",
@@ -2267,24 +2293,16 @@ function createDOMPurify() {
 				value = SANITIZE_NAMED_PROPS_PREFIX + value;
 				recreatedNamedProp = true;
 			}
-			if (_isUnsafeAttributeValue(name, value)) {
-				_removeAttribute(name, currentNode, attr);
-				continue;
-			}
-			if (hookEvent.forceKeepAttr) continue;
-			if (!hookEvent.keepAttr) {
-				_removeAttribute(name, currentNode, attr);
-				continue;
-			}
-			if (!ALLOW_SELF_CLOSE_IN_ATTR && regExpTest(SELF_CLOSING_TAG, value)) {
+			if (!hookEvent.keepAttr && !hookEvent.forceKeepAttr) {
 				_removeAttribute(name, currentNode, attr);
 				continue;
 			}
 			if (SAFE_FOR_TEMPLATES) value = _stripTemplateExpressions(value);
-			if (!_isValidAttribute(lcTag, lcName, value)) {
+			if (!_passesAttributeSecurityGate(lcTag, name, value, allowedAttrSnapshot)) {
 				_removeAttribute(name, currentNode, attr);
 				continue;
 			}
+			if (hookEvent.forceKeepAttr) continue;
 			value = _applyTrustedTypesToAttribute(lcTag, lcName, namespaceURI, value);
 			if (value !== initValue) {
 				if (_setAttributeValue(currentNode, name, namespaceURI, value) && recreatedNamedProp) arrayPop(DOMPurify.removed);
@@ -2392,6 +2410,12 @@ function createDOMPurify() {
 			ALLOWED_TAGS = SET_CONFIG_ALLOWED_TAGS;
 			ALLOWED_ATTR = SET_CONFIG_ALLOWED_ATTR;
 		} else _parseConfig(cfg);
+		const baselineAllowedTags = ALLOWED_TAGS;
+		const baselineAllowedAttrs = ALLOWED_ATTR;
+		const restoreAllowlistBindings = function restoreAllowlistBindings() {
+			ALLOWED_TAGS = baselineAllowedTags;
+			ALLOWED_ATTR = baselineAllowedAttrs;
+		};
 		DOMPurify.removed = [];
 		const inPlace = IN_PLACE && typeof dirty !== "string" && _isNode(dirty);
 		let inPlaceNodes = [];
@@ -2420,9 +2444,16 @@ function createDOMPurify() {
 			else body.appendChild(importedNode);
 			_sanitizeAttachedShadowRoots(body);
 		} else {
-			if (!RETURN_DOM && !SAFE_FOR_TEMPLATES && !WHOLE_DOCUMENT && dirty.indexOf("<") === -1) return _signOutput(dirty);
+			if (!RETURN_DOM && !SAFE_FOR_TEMPLATES && !WHOLE_DOCUMENT && dirty.indexOf("<") === -1) {
+				const signed = _signOutput(dirty);
+				restoreAllowlistBindings();
+				return signed;
+			}
 			body = _initDocument(dirty);
-			if (!body) return RETURN_DOM ? null : RETURN_TRUSTED_TYPE ? emptyHTML : "";
+			if (!body) {
+				restoreAllowlistBindings();
+				return RETURN_DOM ? null : RETURN_TRUSTED_TYPE ? emptyHTML : "";
+			}
 		}
 		if (body && FORCE_BODY) _forceRemove(body.firstChild);
 		const walkRoot = inPlace ? dirty : body;
@@ -2436,6 +2467,7 @@ function createDOMPurify() {
 				_neutralizeRoot(dirty);
 				_neutralizeDiscarded(dirty, inPlaceNodes);
 			}
+			restoreAllowlistBindings();
 			throw error;
 		} finally {
 			IN_PLACE_VISITED = outerVisited;
@@ -2443,6 +2475,7 @@ function createDOMPurify() {
 		if (inPlace) {
 			if (_neutralizeDiscarded(dirty, inPlaceNodes)) throw typeErrorCreate("a node selected for removal could not be safely returned; refusing to sanitize in place");
 			if (SAFE_FOR_TEMPLATES) _scrubTemplateExpressions2(dirty);
+			restoreAllowlistBindings();
 			return dirty;
 		}
 		if (RETURN_DOM) {
@@ -2452,11 +2485,13 @@ function createDOMPurify() {
 				while (body.firstChild) returnNode.appendChild(body.firstChild);
 			} else returnNode = body;
 			if (ALLOWED_ATTR.shadowroot || ALLOWED_ATTR.shadowrootmode) returnNode = importNode.call(originalDocument, returnNode, true);
+			restoreAllowlistBindings();
 			return returnNode;
 		}
 		if (SAFE_FOR_TEMPLATES) _scrubOwnCharacterData(body);
 		let serializedHTML = WHOLE_DOCUMENT ? body.outerHTML : body.innerHTML;
 		if (WHOLE_DOCUMENT && ALLOWED_TAGS["!doctype"] && body.ownerDocument && body.ownerDocument.doctype && body.ownerDocument.doctype.name && regExpTest(DOCTYPE_NAME, body.ownerDocument.doctype.name)) serializedHTML = "<!DOCTYPE " + body.ownerDocument.doctype.name + ">\n" + serializedHTML;
+		restoreAllowlistBindings();
 		return _signOutput(serializedHTML);
 	};
 	DOMPurify.setConfig = function() {
@@ -2477,9 +2512,7 @@ function createDOMPurify() {
 	DOMPurify.isValidAttribute = function(tag, attr, value) {
 		if (!CONFIG) _parseConfig({});
 		const lcTag = transformCaseFunc(tag);
-		const lcName = transformCaseFunc(attr);
-		if (typeof value === "string" && (_isUnsafeAttributeValue(attr, value) || !ALLOW_SELF_CLOSE_IN_ATTR && regExpTest(SELF_CLOSING_TAG, value))) return false;
-		return _isValidAttribute(lcTag, lcName, value);
+		return _passesAttributeSecurityGate(lcTag, attr, typeof value === "string" ? value : String(value));
 	};
 	DOMPurify.addHook = function(entryPoint, hookFunction) {
 		if (typeof hookFunction !== "function") return;

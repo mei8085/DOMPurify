@@ -2247,7 +2247,8 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
   const _isValidAttribute = function (
     lcTag: string,
     lcName: string,
-    value: string
+    value: string,
+    allowedAttrSnapshot: Record<string, any> | null = null
   ): boolean {
     /* FORBID_ATTR must always win, even if ADD_ATTR predicate would allow it */
     if (FORBID_ATTR[lcName]) {
@@ -2272,8 +2273,15 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       return false;
     }
 
+    /* When the walk supplies a snapshot, it is the allow-list membership as
+       resolved from the configuration before any hook ran. A hook writing
+       into hookEvent.allowedAttributes, or a nested sanitize() call that
+       re-parses the configuration, cannot widen this verdict after the
+       fact. The public precheck passes no snapshot and reads the live
+       (hook-free) configuration directly. */
+    const allowedAttrSet = allowedAttrSnapshot || ALLOWED_ATTR;
     const nameIsPermitted =
-      ALLOWED_ATTR[lcName] ||
+      allowedAttrSet[lcName] ||
       (EXTRA_ELEMENT_HANDLING.attributeCheck instanceof Function &&
         EXTRA_ELEMENT_HANDLING.attributeCheck(lcName, lcTag));
 
@@ -2350,6 +2358,49 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     /* Only an empty (binary) value remains safe at this point;
        anything else is presumed unsafe, do not add it back */
     return !value;
+  };
+
+  /**
+   * The single security gate for an attribute, shared by the public
+   * isValidAttribute() precheck and the per-attribute walk in
+   * _sanitizeAttributes. Every check that can condemn an attribute lives
+   * here and nowhere else, so an attribute approved by the precheck cannot
+   * be re-admitted later by a hook (forceKeepAttr/keepAttr), by an
+   * allow-list object widened mid-call, or by configuration re-parsed from
+   * a nested sanitize() call. Conversely, anything this gate rejects is
+   * removed from the final node regardless of hook decisions.
+   *
+   * @param lcTag transformCaseFunc'd tag name of the carrying element
+   * @param name the attribute name as found on the node (case preserved)
+   * @param value the attribute value after hook/template processing
+   * @param allowedAttrSnapshot allow-list membership captured before the
+   *   hooks ran; null means "read the live configuration" (precheck path)
+   * @return true only if the attribute may stay on the final node
+   */
+  const _passesAttributeSecurityGate = function (
+    lcTag: string,
+    name: string,
+    value: string,
+    allowedAttrSnapshot: Record<string, any> | null = null
+  ): boolean {
+    const lcName = transformCaseFunc(name);
+
+    /* Structural value threats that apply before any allow-list or hook
+       decision (comment / raw-text closers, animated hrefs). */
+    if (_isUnsafeAttributeValue(name, value)) {
+      return false;
+    }
+
+    /* Work around a security issue in jQuery 3.0 */
+    if (
+      !ALLOW_SELF_CLOSE_IN_ATTR &&
+      regExpTest(EXPRESSIONS.SELF_CLOSING_TAG, value)
+    ) {
+      return false;
+    }
+
+    /* Name + URI safety against the pre-hook configuration snapshot. */
+    return _isValidAttribute(lcTag, lcName, value, allowedAttrSnapshot);
   };
 
   /* Names the HTML spec reserves from valid-custom-element-name; these must
@@ -2525,6 +2576,16 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       SET_CONFIG_ALLOWED_ATTR
     );
 
+    /* Freeze the allow-list membership before any hook runs. The final
+       security gate consults this snapshot rather than the live set, so a
+       hook widening hookEvent.allowedAttributes (or a nested sanitize()
+       re-parsing the configuration) cannot admit an attribute the
+       precheck, running on the same configuration, would reject. The
+       hook-facing object is still the mutable, forked live set: harmless
+       widening of custom, non-executable names keeps working, it simply
+       cannot relax a verdict on dangerous names. */
+    const allowedAttrSnapshot = cloneSet(ALLOWED_ATTR);
+
     const hookEvent = {
       attrName: '',
       attrValue: '',
@@ -2576,29 +2637,9 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       }
       // Else: already prefixed, and the prefix is the protection
 
-      /* Value checks that apply regardless of hooks (comment / raw-text
-         closers in the value, animated hrefs); see _isUnsafeAttributeValue. */
-      if (_isUnsafeAttributeValue(name, value)) {
-        _removeAttribute(name, currentNode, attr);
-        continue;
-      }
-
-      /* Did the hooks force-keep the attribute? */
-      if (hookEvent.forceKeepAttr) {
-        continue;
-      }
-
-      /* Did the hooks approve of the attribute? */
-      if (!hookEvent.keepAttr) {
-        _removeAttribute(name, currentNode, attr);
-        continue;
-      }
-
-      /* Work around a security issue in jQuery 3.0 */
-      if (
-        !ALLOW_SELF_CLOSE_IN_ATTR &&
-        regExpTest(EXPRESSIONS.SELF_CLOSING_TAG, value)
-      ) {
+      /* Did the hooks reject the attribute? forceKeepAttr still gets a
+         say below, but it can no longer outrank the shared security gate. */
+      if (!hookEvent.keepAttr && !hookEvent.forceKeepAttr) {
         _removeAttribute(name, currentNode, attr);
         continue;
       }
@@ -2608,9 +2649,23 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         value = _stripTemplateExpressions(value);
       }
 
-      /* Is `value` valid for this attribute? */
-      if (!_isValidAttribute(lcTag, lcName, value)) {
+      /* The single security decision, shared with isValidAttribute().
+         It runs after every hook and every value mutation so neither a
+         forceKeepAttr decision, an allow-list widened through
+         hookEvent.allowedAttributes, nor a config re-parsed by a nested
+         sanitize() call can relax the precheck verdict. Anything it
+         rejects is stripped from the final node, hooks included. */
+      if (
+        !_passesAttributeSecurityGate(lcTag, name, value, allowedAttrSnapshot)
+      ) {
         _removeAttribute(name, currentNode, attr);
+        continue;
+      }
+
+      /* Did the hooks force-keep the attribute? Its value already passed
+         the same gate the precheck uses, so keeping it cannot arm the
+         node beyond what isValidAttribute() would approve. */
+      if (hookEvent.forceKeepAttr) {
         continue;
       }
 
@@ -2796,6 +2851,18 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
       _parseConfig(cfg);
     }
 
+    /* The allow-lists a hook can fork and widen are module-level bindings.
+       Remember the configuration's own sets and rebind them before this call
+       returns, so a forked clone (and any attribute a hook wrote into it)
+       cannot leak into a later sanitize() or an isValidAttribute() precheck.
+       A nested sanitize() captures its own baseline and restores back to it. */
+    const baselineAllowedTags = ALLOWED_TAGS;
+    const baselineAllowedAttrs = ALLOWED_ATTR;
+    const restoreAllowlistBindings = function (): void {
+      ALLOWED_TAGS = baselineAllowedTags;
+      ALLOWED_ATTR = baselineAllowedAttrs;
+    };
+
     /* Clean up removed elements */
     DOMPurify.removed = [];
 
@@ -2864,7 +2931,9 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         // eslint-disable-next-line unicorn/prefer-includes
         dirty.indexOf('<') === -1
       ) {
-        return _signOutput(dirty);
+        const signed = _signOutput(dirty);
+        restoreAllowlistBindings();
+        return signed;
       }
 
       /* Initialize the document to work on */
@@ -2872,6 +2941,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
 
       /* Check we have a DOM node from the data */
       if (!body) {
+        restoreAllowlistBindings();
         return RETURN_DOM ? null : RETURN_TRUSTED_TYPE ? emptyHTML : '';
       }
     }
@@ -2905,6 +2975,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         _neutralizeDiscarded(dirty as Node, inPlaceNodes);
       }
 
+      restoreAllowlistBindings();
       throw error;
     } finally {
       IN_PLACE_VISITED = outerVisited;
@@ -2923,6 +2994,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         _scrubTemplateExpressions(dirty as Element);
       }
 
+      restoreAllowlistBindings();
       return dirty;
     }
 
@@ -2954,6 +3026,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         returnNode = importNode.call(originalDocument, returnNode, true);
       }
 
+      restoreAllowlistBindings();
       return returnNode;
     }
 
@@ -2978,6 +3051,7 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
         '<!DOCTYPE ' + body.ownerDocument.doctype.name + '>\n' + serializedHTML;
     }
 
+    restoreAllowlistBindings();
     return _signOutput(serializedHTML);
   };
 
@@ -3007,22 +3081,16 @@ function createDOMPurify(window: WindowLike = getGlobal()): DOMPurify {
     }
 
     const lcTag = transformCaseFunc(tag);
-    const lcName = transformCaseFunc(attr);
 
-    /* Apply the same value checks sanitize() applies to an attribute when no
-       hook intervenes, so a value approved here is one sanitize() would also
-       keep: comment / raw-text closers, animated hrefs, and the jQuery 3.0
-       self-closing-tag pattern. */
-    if (
-      typeof value === 'string' &&
-      (_isUnsafeAttributeValue(attr, value) ||
-        (!ALLOW_SELF_CLOSE_IN_ATTR &&
-          regExpTest(EXPRESSIONS.SELF_CLOSING_TAG, value)))
-    ) {
-      return false;
-    }
+    /* Attribute values are strings once parsed; coerce anything else the
+       same way the walk would see it after DOM serialization. */
+    const normalizedValue = typeof value === 'string' ? value : String(value);
 
-    return _isValidAttribute(lcTag, lcName, value);
+    /* Run the exact same security gate _sanitizeAttributes runs after every
+       hook, so a value approved here is one sanitize() cannot strip later,
+       and nothing rejected here can be re-admitted by a hook or a widened
+       allow-list. */
+    return _passesAttributeSecurityGate(lcTag, attr, normalizedValue);
   };
 
   DOMPurify.addHook = function (

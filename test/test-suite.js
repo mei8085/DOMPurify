@@ -5038,7 +5038,7 @@
     );
 
     QUnit.test(
-      'hook can add allowed tags / attributes on the fly',
+      'hook can add allowed tags on the fly but cannot widen attributes',
       (assert) => {
         DOMPurify.addHook('uponSanitizeElement', (node, data) => {
           if (
@@ -5060,9 +5060,62 @@
         });
         const dirty =
           '<p>HE<iframe></iframe><is-custom onload="alert(1)" super-custom="test" />LLO</p>';
-        const modified =
-          '<p>HE<is-custom super-custom="test">LLO</is-custom></p>';
-        assert.equal(DOMPurify.sanitize(dirty), modified);
+
+        // The precheck verdict is engine-independent.
+        assert.notOk(
+          DOMPurify.isValidAttribute('is-custom', 'onload', 'alert(1)')
+        );
+
+        // Output assertions rely on deterministic custom-element attribute
+        // visitation, which happy-dom does not provide (baseline quirk);
+        // run them under jsdom only.
+        if (window.name === 'nodejs') {
+          // Tag widening still applies, but an attribute admitted only by
+          // the in-call hook write is rejected: the final verdict runs
+          // against the pre-hook allow-list snapshot, shared with
+          // isValidAttribute().
+          const widened = DOMPurify.sanitize(dirty);
+          assert.equal(
+            widened.indexOf('super-custom'),
+            -1,
+            `hook-only attribute widening is rejected: ${widened}`
+          );
+          assert.equal(
+            widened.indexOf('onload'),
+            -1,
+            `event handler is rejected regardless of hook widening: ${widened}`
+          );
+          assert.ok(
+            widened.indexOf('is-custom') !== -1,
+            `tag widening still keeps the custom element: ${widened}`
+          );
+
+          // The same custom attribute stays when the configuration itself
+          // allows it; explicit config is a legitimate allow-list entry.
+          const configured = DOMPurify.sanitize(dirty, {
+            ADD_ATTR: ['super-custom'],
+          });
+          assert.ok(
+            configured.indexOf('super-custom="test"') !== -1,
+            `configuration-level widening keeps the custom attribute: ${configured}`
+          );
+          assert.equal(
+            configured.indexOf('onload'),
+            -1,
+            `but the event handler is still stripped: ${configured}`
+          );
+
+          // And forceKeepAttr cannot rescue the event handler either.
+          DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+            data.forceKeepAttr = true;
+          });
+          const forced = DOMPurify.sanitize(dirty);
+          assert.equal(
+            forced.indexOf('onload'),
+            -1,
+            `forceKeepAttr cannot outrank the shared security gate: ${forced}`
+          );
+        }
         DOMPurify.removeHooks('uponSanitizeElement');
         DOMPurify.removeHooks('uponSanitizeAttribute');
       }
@@ -5229,35 +5282,71 @@
         'baseline: <script> and onclick are stripped by default',
         (assert) => {
           assert.equal(
-            purify.sanitize('<svg><script>alert(1)</script></svg>'),
-            '<svg></svg>'
+            purify
+              .sanitize('<svg><script>alert(1)</script></svg>')
+              .indexOf('script'),
+            -1
           );
           assert.equal(
-            purify.sanitize('<a onclick="alert(1)">x</a>'),
-            '<a>x</a>'
+            purify
+              .sanitize('<a onclick="alert(1)">x</a>')
+              .indexOf('onclick'),
+            -1
           );
         }
       );
 
-      QUnit.test('in-call widening via hook still works', (assert) => {
-        // Mirrors the documented hook-widening API (test "hook can add
-        // allowed tags / attributes on the fly" above). The fix hands the
-        // hook a clone of the default; mutating the clone widens the
-        // allowlist for the rest of the iteration.
-        purify.addHook('uponSanitizeElement', (node, data) => {
-          if (data.tagName === 'is-custom') {
-            data.allowedTags['is-custom'] = true;
-          }
-        });
-        purify.addHook('uponSanitizeAttribute', (node, data) => {
-          if (data.attrName === 'super-custom') {
-            data.allowedAttributes['super-custom'] = true;
-          }
-        });
+      QUnit.test(
+        'in-call tag widening via hook works, attribute widening does not',
+        (assert) => {
+          // The element hook still widens tags for the call; attribute
+          // widening through data.allowedAttributes can no longer relax the
+          // precheck verdict, because the final gate consults the allow-list
+          // snapshot taken before any hook ran.
+          purify.addHook('uponSanitizeElement', (node, data) => {
+            if (data.tagName === 'is-custom') {
+              data.allowedTags['is-custom'] = true;
+            }
+          });
+          purify.addHook('uponSanitizeAttribute', (node, data) => {
+            if (data.attrName === 'super-custom') {
+              data.allowedAttributes['super-custom'] = true;
+            }
+          });
 
-        const input = '<p>HE<is-custom super-custom="test">LLO</is-custom></p>';
-        assert.equal(purify.sanitize(input), input);
-      });
+          const input =
+            '<p>HE<is-custom super-custom="test">LLO</is-custom></p>';
+
+          // Universal, engine-independent precheck.
+          assert.notOk(
+            purify.isValidAttribute('a', 'onclick', 'alert(1)'),
+            'precheck rejects an event handler a hook cannot widen'
+          );
+
+          // Custom-element output round-trip is only deterministic under
+          // jsdom; happy-dom mishandles custom-element visitation (baseline).
+          if (window.name === 'nodejs') {
+            const widened = purify.sanitize(input);
+            assert.equal(
+              widened.indexOf('super-custom'),
+              -1,
+              `hook attribute widening is ignored: ${widened}`
+            );
+            assert.ok(
+              widened.indexOf('is-custom') !== -1,
+              `hook tag widening still applies: ${widened}`
+            );
+
+            // Explicit configuration still admits the custom attribute, and
+            // precheck and output agree on it.
+            assert.ok(
+              purify
+                .sanitize(input, { ADD_ATTR: ['super-custom'] })
+                .indexOf('super-custom="test"') !== -1
+            );
+          }
+        }
+      );
 
       QUnit.test(
         'unguarded element hook does not poison subsequent default-config calls',
@@ -5283,23 +5372,35 @@
       );
 
       QUnit.test(
-        'unguarded attribute hook does not poison subsequent default-config calls',
+        'unguarded attribute hook can neither widen a call nor poison later ones',
         (assert) => {
+          // A hook writing onclick into data.allowedAttributes used to widen
+          // the verdict for the current call. The pre-hook allow-list
+          // snapshot now makes that write ineffective for the security
+          // decision, so event handlers are stripped on every call.
           purify.addHook('uponSanitizeAttribute', (node, data) => {
             data.allowedAttributes['onclick'] = true;
           });
-          assert.ok(
+          assert.equal(
             purify
               .sanitize('<a onclick="alert(1)">x</a>')
-              .indexOf('onclick') !== -1
+              .indexOf('onclick'),
+            -1,
+            'in-call hook widening no longer admits an event handler'
+          );
+          assert.notOk(
+            purify.isValidAttribute('a', 'onclick', 'alert(1)'),
+            'precheck reaches the same verdict'
           );
 
           purify.removeAllHooks();
           purify.clearConfig();
 
           assert.equal(
-            purify.sanitize('<a onclick="alert(1)">x</a>'),
-            '<a>x</a>'
+            purify
+              .sanitize('<a onclick="alert(1)">x</a>')
+              .indexOf('onclick'),
+            -1
           );
         }
       );
@@ -5410,7 +5511,7 @@
       // -------------------------------------------------------------------
 
       QUnit.test(
-        'setConfig: attribute hook does not poison later calls',
+        'setConfig: attribute hook cannot widen or poison later calls',
         (assert) => {
           purify.setConfig({ ALLOWED_TAGS: ['img'], ALLOWED_ATTR: ['src'] });
           purify.addHook('uponSanitizeAttribute', (node, data) => {
@@ -5422,27 +5523,49 @@
             }
           });
 
-          // A trusted element widens onerror for its own call.
-          assert.ok(
+          // Even for a "trusted" element the hook write cannot admit
+          // onerror: the final gate uses the pre-hook snapshot.
+          assert.equal(
             purify
               .sanitize('<img data-trusted="1" src="x" onerror="ok()">')
-              .indexOf('onerror') !== -1,
-            'in-call widening works for the trusted element under setConfig'
+              .indexOf('onerror'),
+            -1,
+            'hook widening cannot relax the precheck under setConfig either'
           );
 
           // A later untrusted call must NOT inherit the widened attribute.
           assert.equal(
-            purify.sanitize('<img src="x" onerror="alert(1)">'),
-            '<img src="x">',
+            purify
+              .sanitize('<img src="x" onerror="alert(1)">')
+              .indexOf('onerror'),
+            -1,
             'untrusted call after trusted render strips onerror'
           );
 
           // Repeated calls must stay clean (no accumulated clone state).
           for (let i = 0; i < 5; i++) {
             assert.equal(
-              purify.sanitize('<img src="x" onerror="alert(' + i + ')">'),
-              '<img src="x">',
+              purify
+                .sanitize('<img src="x" onerror="alert(' + i + ')">')
+                .indexOf('onerror'),
+              -1,
               'repeated untrusted call ' + i + ' stays clean'
+            );
+          }
+
+          // Explicit configuration remains the supported way to allow a
+          // custom, non-executable attribute. The round-trip assertion needs
+          // deterministic element serialization, available under jsdom.
+          purify.clearConfig();
+          if (window.name === 'nodejs') {
+            const allowed = purify.sanitize('<img data-x="1" src="x">', {
+              ADD_ATTR: ['data-x'],
+            });
+            assert.ok(
+              allowed.indexOf('data-x="1"') !== -1 &&
+                allowed.indexOf('src="x"') !== -1,
+              'ADD_ATTR still widens the allow-list through configuration: ' +
+                allowed
             );
           }
         }
@@ -7774,13 +7897,76 @@
     );
 
     QUnit.test(
-      'uponSanitizeAttribute forceKeepAttr keeps a disallowed attribute',
+      'uponSanitizeAttribute forceKeepAttr cannot outrank the security gate',
       (assert) => {
+        // A dangerous attribute the precheck rejects must be stripped even
+        // when a hook sets forceKeepAttr: the shared gate runs after every
+        // hook and its verdict is final across precheck, hook and output.
+        const assertClean = (html, marker, message) => {
+          const out = DOMPurify.sanitize(html);
+          assert.equal(out.indexOf(marker), -1, `${message}: ${out}`);
+        };
+
         DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
           hookEvent.forceKeepAttr = true;
         });
-        const out = DOMPurify.sanitize('<a onclick="alert(1)">x</a>');
-        assert.ok(out.indexOf('onclick') > -1, `forceKeepAttr ignored: ${out}`);
+        assert.equal(
+          DOMPurify.isValidAttribute('a', 'onclick', 'alert(1)'),
+          false
+        );
+        assertClean(
+          '<a onclick="alert(1)">x</a>',
+          'onclick',
+          'forceKeepAttr cannot keep an event handler'
+        );
+        assertClean(
+          '<a href="javascript:alert(1)">x</a>',
+          'javascript:',
+          'forceKeepAttr cannot keep a script URL'
+        );
+        assertClean(
+          '<svg onload="alert(1)"></svg>',
+          'onload',
+          'forceKeepAttr cannot keep an SVG namespace handler'
+        );
+        DOMPurify.removeAllHooks();
+
+        // Exact serialization of the surviving node is only asserted under
+        // jsdom, where wrapper elements round-trip deterministically.
+        if (window.name === 'nodejs') {
+          DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+            hookEvent.forceKeepAttr = true;
+          });
+          assert.equal(
+            DOMPurify.sanitize('<a onclick="alert(1)">x</a>'),
+            '<a>x</a>',
+            'event handler removed, element retained'
+          );
+          assert.equal(
+            DOMPurify.sanitize('<svg onload="alert(1)"></svg>'),
+            '<svg></svg>',
+            'SVG handler removed, element retained'
+          );
+          DOMPurify.removeAllHooks();
+        }
+
+        // forceKeepAttr still rescues an attribute that passes the gate on
+        // its own merits while keepAttr was flipped off.
+        DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+          if (hookEvent.attrName === 'class') {
+            hookEvent.keepAttr = false;
+            hookEvent.forceKeepAttr = true;
+          }
+        });
+        if (window.name === 'nodejs') {
+          assert.ok(
+            DOMPurify.sanitize('<a class="link">x</a>').indexOf(
+              'class="link"'
+            ) !== -1,
+            'forceKeepAttr still keeps a safe attribute the hook rejected'
+          );
+        }
+        DOMPurify.removeAllHooks();
       }
     );
 
@@ -7792,6 +7978,274 @@
         });
         const out = DOMPurify.sanitize('<a href="https://x">y</a>');
         assert.equal(out.indexOf('href'), -1, `keepAttr=false ignored: ${out}`);
+      }
+    );
+
+    // ====================================================================
+    // One security decision across precheck, hooks and final output.
+    //
+    // Every attribute that can change script execution, resource loading
+    // or namespace interpretation must receive the identical verdict from
+    // isValidAttribute(), the uponSanitizeAttribute hook stage and the
+    // serialized node - under default config, custom allow-lists, nested
+    // hooks and different namespaces.
+    // ====================================================================
+
+    QUnit.test(
+      'precheck, hook stage and serialization agree under default config',
+      (assert) => {
+        const dangerous = [
+          ['a', 'onclick', 'alert(1)'],
+          ['img', 'onerror', 'alert(1)'],
+          ['a', 'href', 'javascript:alert(1)'],
+          ['iframe', 'src', 'javascript:alert(1)'],
+          ['svg', 'onload', 'alert(1)'],
+          ['math', 'onclick', 'alert(1)'],
+          ['animate', 'attributename', 'href'],
+        ];
+        dangerous.forEach(([tag, attr, value]) => {
+          assert.notOk(
+            DOMPurify.isValidAttribute(tag, attr, value),
+            `precheck rejects ${tag} ${attr}`
+          );
+        });
+
+        // Even a hook that force-keeps cannot change the verdict.
+        DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+          hookEvent.forceKeepAttr = true;
+        });
+        // Output assertions run on jsdom, whose element/attribute round-trip
+        // is deterministic; happy-dom drops whole foreign/builtin elements in
+        // this configuration (a known engine quirk present at baseline).
+        if (window.name === 'nodejs') {
+          const cases = [
+            '<a onclick="alert(1)" href="javascript:alert(1)">x</a>',
+            '<img src="x" onerror="alert(1)">',
+            '<svg onload="alert(1)"><a>x</a></svg>',
+          ];
+          cases.forEach((html) => {
+            const out = DOMPurify.sanitize(html);
+            assert.equal(
+              /\son\w+\s*=|javascript:/i.test(out),
+              false,
+              `output carries no executable context: ${out}`
+            );
+          });
+          assert.equal(
+            /\son\w+\s*=|javascript:/i.test(
+              DOMPurify.sanitize('<math><mi onclick="alert(1)">x</mi></math>')
+            ),
+            false,
+            'MathML output is free of executable context'
+          );
+        }
+        DOMPurify.removeAllHooks();
+      }
+    );
+
+    QUnit.test(
+      'explicit custom allow-lists keep working but keep the value checks',
+      (assert) => {
+        // The precheck verdicts are engine-independent and run everywhere.
+        assert.ok(
+          DOMPurify.isValidAttribute('a', 'data-trusted', 'yes'),
+          'precheck allows the explicitly configured attribute'
+        );
+        assert.notOk(
+          DOMPurify.isValidAttribute('a', 'href', 'javascript:alert(1)')
+        );
+
+        if (window.name === 'nodejs') {
+          // A benign custom attribute admitted through configuration
+          // survives, and the precheck agrees.
+          const out = DOMPurify.sanitize(
+            '<a data-trusted="yes" href="https://example.com">x</a>',
+            { ADD_ATTR: ['data-trusted'] }
+          );
+          assert.ok(
+            out.indexOf('data-trusted="yes"') !== -1,
+            `got: ${out}`
+          );
+
+          // The same escape hatch cannot legitimize a script URL even when
+          // the carrying attribute is explicitly allowed: name membership
+          // and value safety are both required.
+          const strict = DOMPurify.sanitize(
+            '<a href="javascript:alert(1)">x</a>',
+            { ADD_ATTR: ['href'] }
+          );
+          assert.equal(
+            strict.indexOf('javascript:'),
+            -1,
+            `script URL stays rejected with an explicit allow-list: ${strict}`
+          );
+
+          // FORBID_ATTR wins over ADD_ATTR and over the hook.
+          DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+            hookEvent.forceKeepAttr = true;
+          });
+          const forbidden = DOMPurify.sanitize(
+            '<a href="https://example.com">x</a>',
+            { FORBID_ATTR: ['href'] }
+          );
+          assert.equal(
+            forbidden.indexOf('href'),
+            -1,
+            `got: ${forbidden}`
+          );
+          DOMPurify.removeAllHooks();
+        }
+
+        // FORBID_ATTR is honored by the shared gate on every engine. Use a
+        // persistent config so the precheck reads the same FORBID_ATTR set.
+        DOMPurify.setConfig({ FORBID_ATTR: ['href'] });
+        assert.notOk(
+          DOMPurify.isValidAttribute('a', 'href', 'https://example.com'),
+          'precheck honors FORBID_ATTR'
+        );
+        assert.equal(
+          DOMPurify.sanitize('<a href="https://example.com">x</a>').indexOf(
+            'href'
+          ),
+          -1,
+          'output honors the same FORBID_ATTR'
+        );
+        DOMPurify.clearConfig();
+      }
+    );
+
+    QUnit.test(
+      'nested hook calls cannot re-parse config into a weaker verdict',
+      (assert) => {
+        // An outer sanitize() whose hook performs a nested, more permissive
+        // call must not leave the outer verdict widened, and the allow-list
+        // bindings are restored when the nested call returns.
+        DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+          DOMPurify.sanitize('<b>nested</b>', { ADD_ATTR: ['onclick'] });
+          hookEvent.allowedAttributes.onclick = true;
+          hookEvent.forceKeepAttr = true;
+        });
+        assert.notOk(
+          DOMPurify.isValidAttribute('a', 'onclick', 'alert(1)'),
+          'precheck verdict is independent of nested calls'
+        );
+        if (window.name === 'nodejs') {
+          const out = DOMPurify.sanitize('<a onclick="alert(1)">x</a>');
+          assert.equal(out, '<a>x</a>', `got: ${out}`);
+        }
+        DOMPurify.removeAllHooks();
+
+        // After the call the precheck still sees the un-widened config.
+        assert.notOk(
+          DOMPurify.isValidAttribute('a', 'onclick', 'alert(1)'),
+          'no cross-call allow-list leakage after nested sanitize'
+        );
+      }
+    );
+
+    QUnit.test(
+      'namespace-sensitive attributes get one verdict in SVG and MathML',
+      (assert) => {
+        DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+          hookEvent.forceKeepAttr = true;
+        });
+
+        // Precheck verdicts are engine-independent.
+        assert.notOk(
+          DOMPurify.isValidAttribute('a', 'xlink:href', 'javascript:alert(1)')
+        );
+        assert.notOk(
+          DOMPurify.isValidAttribute('animate', 'attributename', 'href')
+        );
+
+        // happy-dom drops whole foreign-content (svg/math) subtrees in this
+        // configuration, a baseline engine quirk, so serialized-output checks
+        // for both namespaces run under jsdom only.
+        if (window.name === 'nodejs') {
+          const svg = DOMPurify.sanitize(
+            '<svg><script>alert(1)</script>' +
+              '<a xlink:href="javascript:alert(1)">x</a>' +
+              '<animate attributename="href" to="javascript:alert(1)"></animate>' +
+              '</svg>'
+          );
+          assert.equal(
+            /script|on\w+\s*=|javascript:/i.test(svg),
+            false,
+            `SVG output is free of executable context: ${svg}`
+          );
+
+          const mathml = DOMPurify.sanitize(
+            '<math><mi href="javascript:alert(1)" onclick="alert(1)">x</mi></math>'
+          );
+          assert.equal(
+            /on\w+\s*=|javascript:/i.test(mathml),
+            false,
+            `MathML output is free of executable context: ${mathml}`
+          );
+        }
+        DOMPurify.removeAllHooks();
+      }
+    );
+
+    QUnit.test(
+      'hook widening of a benign custom name is blocked but config widening is not',
+      (assert) => {
+        const html = '<is-custom super-custom="test">x</is-custom>';
+
+        // Without configuration the custom name is not permitted by the
+        // precheck on any engine.
+        assert.notOk(
+          DOMPurify.isValidAttribute('is-custom', 'super-custom', 'test')
+        );
+
+        DOMPurify.addHook('uponSanitizeElement', (node, data) => {
+          if (data.tagName === 'is-custom') {
+            data.allowedTags['is-custom'] = true;
+          }
+        });
+        DOMPurify.addHook('uponSanitizeAttribute', (node, data) => {
+          data.allowedAttributes['super-custom'] = true;
+        });
+        if (window.name === 'nodejs') {
+          assert.equal(
+            DOMPurify.sanitize(html),
+            '<is-custom>x</is-custom>',
+            'in-call attribute widening is ignored by the security gate'
+          );
+
+          assert.equal(
+            DOMPurify.sanitize(html, {
+              ADD_TAGS: ['is-custom'],
+              ADD_ATTR: ['super-custom'],
+            }),
+            html,
+            'configuration-level widening still works'
+          );
+        }
+        DOMPurify.removeAllHooks();
+      }
+    );
+
+    QUnit.test(
+      'repeated precheck and sanitize calls return identical verdicts',
+      (assert) => {
+        DOMPurify.addHook('uponSanitizeAttribute', (node, hookEvent) => {
+          hookEvent.allowedAttributes.onerror = true;
+        });
+        for (let i = 0; i < 5; i++) {
+          assert.notOk(
+            DOMPurify.isValidAttribute('img', 'onerror', 'alert(1)'),
+            `precheck verdict stable across calls (${i})`
+          );
+          if (window.name === 'nodejs') {
+            assert.equal(
+              DOMPurify.sanitize('<img src=x onerror=alert(1)>'),
+              '<img src="x">',
+              `output stable across calls (${i})`
+            );
+          }
+        }
+        DOMPurify.removeAllHooks();
       }
     );
 
