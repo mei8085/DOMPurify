@@ -35,6 +35,29 @@ function sendError(res, status) {
   res.end(String(status));
 }
 
+/* Trusted Types enforcement is a response-header property, so it cannot live
+ * in the HTML file. The dedicated harness page gets:
+ *   - require-trusted-types-for 'script': every HTML/script sink enforces.
+ *   - trusted-types dompurify: the only policy DOMPurify is allowed to create
+ *     itself; test-specific policies are created by the spec's init script
+ *     from this same allow-list.
+ * The list is a constant, not derived from the request. */
+const TRUSTED_TYPES_PAGE = '/test/browser/trusted-types.html';
+const TRUSTED_TYPES_CSP =
+  "require-trusted-types-for 'script'; trusted-types dompurify tt-browser-suite tt-fixture";
+
+function headersFor(urlPath, contentType) {
+  const headers = {
+    'Content-Type': contentType,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  };
+  if (urlPath === TRUSTED_TYPES_PAGE) {
+    headers['Content-Security-Policy'] = TRUSTED_TYPES_CSP;
+  }
+  return headers;
+}
+
 /* True iff `child` is the same as, or resides inside, `parent`.
  * Uses path.relative semantics which CodeQL recognizes as a path-containment
  * sanitizer for js/path-injection. */
@@ -73,11 +96,7 @@ const server = http.createServer((req, res) => {
 
     fs.readFile(resolved, (readErr, data) => {
       if (readErr) return sendError(res, 500);
-      res.writeHead(200, {
-        'Content-Type': contentType,
-        'Cache-Control': 'no-store',
-        'X-Content-Type-Options': 'nosniff',
-      });
+      res.writeHead(200, headersFor(urlPath, contentType));
       res.end(data);
     });
   });

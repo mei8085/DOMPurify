@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>DOMPurify — Trusted Types attribute signing</title>
+  </head>
+  <body>
+    <!--
+      Minimal harness for test/trusted-types-browser.spec.js.
+
+      The spec serves this document with a Trusted Types CSP
+      (require-trusted-types-for 'script'), which cannot be expressed as a
+      static file in this directory. Everything the tests need comes from
+      dist/purify.js plus the init script the spec installs.
+    -->
+    <script src="/dist/purify.js"></script>
+  </body>
+</html>

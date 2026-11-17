@@ -15,7 +15,7 @@ const isCI = Boolean(process.env.CI);
 
 module.exports = defineConfig({
   testDir: '../test',
-  testMatch: ['browser.spec.js'],
+  testMatch: ['browser.spec.js', 'trusted-types-browser.spec.js'],
   timeout: 120_000,
   fullyParallel: true,
   forbidOnly: isCI,

@@ -17,6 +17,7 @@ require('jquery')(window);
 
 const sanitizeTestSuite = require('./test-suite');
 const bootstrapTestSuite = require('./bootstrap-test-suite');
+const trustedTypesAttributeSuite = require('./trusted-types-attributes');
 
 async function startQUnit() {
   const { default: tests } = await import('./fixtures/expect.mjs');
@@ -36,6 +37,10 @@ async function startQUnit() {
   QUnit.config.autostart = false;
 
   QUnit.module('DOMPurify - bootstrap', bootstrapTestSuite(JSDOM));
+
+  // Trusted Types enforcement against the attribute sinks. Runs in its own
+  // modules (fresh realm per test), before the shared-realm suite below.
+  trustedTypesAttributeSuite(JSDOM);
 
   QUnit.module('DOMPurify in jsdom');
 
